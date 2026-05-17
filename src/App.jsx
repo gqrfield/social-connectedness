@@ -51,7 +51,20 @@ export default function App() {
   const [selectedRegion, setSelectedRegion] = useState('None');
   const [selectedAnchorId, setSelectedAnchorId] = useState(null);
   const [thresholdMultiplier, setThresholdMultiplier] = useState(0);
+  // ─── FIX D: separate display value from committed value ──────────────────
+  // Without this, dragging the slider calls setThresholdMultiplier ~30×/s,
+  // each tick invalidating both useMemo color lookups and rerunning
+  // buildColorLookup over thousands of entries. sliderDisplay updates the
+  // number label instantly; thresholdMultiplier only commits on pointer release.
+  const [sliderDisplay, setSliderDisplay] = useState(0);
   const [viewState, setViewState] = useState(INITIAL_VIEW_STATE);
+  // ─── FIX C: keep zoom in a ref so panning never invalidates useMemo ─────
+  // viewState fires 60×/s during pan. Including viewState.zoom in layer deps
+  // meant both GeoJsonLayers reconstructed every frame just to recompute
+  // lineWidthMinPixels. Now layers are stable during pan; only zoom-threshold
+  // crossings (zoom > 4.5) cause a layer rebuild via this separate state.
+  const zoomRef = useRef(INITIAL_VIEW_STATE.zoom);
+  const [isZoomedIn, setIsZoomedIn] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
   const [validCountries, setValidCountries] = useState(new Set());
@@ -235,9 +248,12 @@ export default function App() {
     [validCountries, selectedAnchorId, selectedRegion, domesticScores, intlScores]
   );
 
-  // ─── FIX ①: getFillColor/getLineColor use pre-computed Map lookups (O(1)) ─
   const layers = useMemo(() => {
-    const zoomFactor = viewState.zoom > 4.5 ? 35 : 6;
+    // ─── FIX C: isZoomedIn boolean only changes when crossing zoom=4.5 ───────
+    // viewState.zoom was here before — changing 60×/s on every pan frame and
+    // causing both GeoJsonLayers to fully reconstruct each time.
+    const zoomFactor = isZoomedIn ? 35 : 6;
+    const lineWidthMin = isZoomedIn ? 0.4 : 0.05;
     return [
       new GeoJsonLayer({
         id: 'countries-layer',
@@ -259,7 +275,7 @@ export default function App() {
           if (iso2 === 'US') return TRANSPARENT;
           if (iso2 === selectedAnchorId) return ANCHOR_FILL;
           if (validCountries.size > 0 && !validCountries.has(iso2)) return MISSING_FILL;
-          return intlColors[iso2] ?? TRANSPARENT;   // ← O(1) property lookup
+          return intlColors[iso2] ?? TRANSPARENT;
         },
         updateTriggers: {
           getFillColor: [intlColors, validCountries, selectedAnchorId],
@@ -277,7 +293,7 @@ export default function App() {
         filled: true,
         autoHighlight: true,
         highlightColor: [255, 255, 255, 100],
-        lineWidthMinPixels: viewState.zoom > 4.5 ? 0.4 : 0.05,
+        lineWidthMinPixels: lineWidthMin,
         getLineColor: (d) => {
           if (d?.properties?.GID_2 === selectedAnchorId) return ANCHOR_LINE;
           return [255, 255, 255, zoomFactor];
@@ -285,19 +301,18 @@ export default function App() {
         getLineWidth: (d) => (d?.properties?.GID_2 === selectedAnchorId ? 3 : 1),
         getFillColor: (d) => {
           if (d?.properties?.GID_2 === selectedAnchorId) return ANCHOR_FILL;
-          return domesticColors[d?.properties?.GID_2] ?? TRANSPARENT;  // ← O(1) property lookup
+          return domesticColors[d?.properties?.GID_2] ?? TRANSPARENT;
         },
         updateTriggers: {
           getFillColor: [domesticColors, selectedAnchorId],
-          getLineColor: [viewState.zoom, selectedAnchorId],
+          getLineColor: [isZoomedIn, selectedAnchorId],
           getLineWidth: [selectedAnchorId],
-          lineWidthMinPixels: [viewState.zoom],
+          lineWidthMinPixels: [isZoomedIn],
         },
         onClick: onMapClick,
       }),
     ];
-  // ─── Memoize layers — only rebuild when pre-computed Maps change ──────────
-  }, [domesticColors, intlColors, validCountries, selectedAnchorId, viewState.zoom, onMapClick]);
+  }, [domesticColors, intlColors, validCountries, selectedAnchorId, isZoomedIn, onMapClick]);
 
   return (
     <div className="relative w-screen h-screen bg-gray-900 text-white font-sans overflow-hidden">
@@ -320,11 +335,27 @@ export default function App() {
 
       <DeckGL
         viewState={viewState}
-        onViewStateChange={(e) => setViewState(e.viewState)}
+        onViewStateChange={(e) => {
+          setViewState(e.viewState);
+          // ─── FIX C: only trigger re-render when crossing the zoom threshold ─
+          // that changes line widths — not on every pan frame.
+          const newZoom = e.viewState.zoom;
+          const wasZoomedIn = zoomRef.current > 4.5;
+          const nowZoomedIn = newZoom > 4.5;
+          zoomRef.current = newZoom;
+          if (wasZoomedIn !== nowZoomedIn) setIsZoomedIn(nowZoomedIn);
+        }}
         controller={true}
         getTooltip={getTooltip}
         getCursor={({ isHovering }) => (isHovering ? 'pointer' : 'grab')}
         layers={layers}
+        // ─── FIX B: cap device pixel ratio ───────────────────────────────────
+        // Mobile screens have DPR 2–3×. Without this, deck.gl renders at full
+        // native resolution — 4–9× more pixels than a desktop 1× screen.
+        // 1.5 is the sweet spot: halves fragment work with near-invisible quality loss.
+        useDevicePixels={typeof window !== 'undefined' && window.devicePixelRatio > 1
+          ? Math.min(window.devicePixelRatio, 1.5)
+          : true}
       >
         <Map mapStyle="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json" />
       </DeckGL>
@@ -363,17 +394,22 @@ export default function App() {
           <div className="flex justify-between items-center mb-3">
             <p className="text-[10px] text-gray-400 uppercase tracking-widest font-bold">Elastic Noise Filter</p>
             <span className="text-xs text-cyan-400 font-mono font-bold">
-              {thresholdMultiplier > 0 ? '+' : ''}
-              {thresholdMultiplier}σ
+              {sliderDisplay > 0 ? '+' : ''}
+              {sliderDisplay}σ
             </span>
           </div>
+          {/* ─── FIX D: onChange only updates the display label (cheap) ────────
+              onPointerUp commits to thresholdMultiplier which triggers the
+              expensive buildColorLookup via useMemo. Dragging is now free. */}
           <input
             type="range"
             min="-2"
             max="3"
             step="0.1"
-            value={thresholdMultiplier}
-            onChange={(e) => setThresholdMultiplier(parseFloat(e.target.value))}
+            value={sliderDisplay}
+            onChange={(e) => setSliderDisplay(parseFloat(e.target.value))}
+            onPointerUp={(e) => setThresholdMultiplier(parseFloat(e.target.value))}
+            onKeyUp={(e) => setThresholdMultiplier(parseFloat(e.target.value))}
             disabled={selectedRegion === 'None'}
             className="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
           />
