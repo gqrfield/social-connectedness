@@ -31,8 +31,6 @@ export default function App() {
   const [selectedRegion, setSelectedRegion] = useState("None");
   const [hoverInfo, setHoverInfo] = useState(null);
   const [thresholdMultiplier, setThresholdMultiplier] = useState(0); 
-  
-  // --- Track ViewState for dynamic line fading ---
   const [viewState, setViewState] = useState(INITIAL_VIEW_STATE);
 
   const [domesticMap, setDomesticMap] = useState({});
@@ -52,15 +50,14 @@ export default function App() {
         await dbInstance.instantiate(bundle.mainModule, bundle.pthreadWorker);
         URL.revokeObjectURL(worker_url); 
         
-       // Dynamic base URL resolver for GitHub Pages subdirectories
+        // FIX 1: Explicit Subdirectory URL matching for the Parquet engine
         const deployBaseUrl = window.location.origin + import.meta.env.BASE_URL;
-        
         await dbInstance.registerFileURL('gadm_domestic.parquet', new URL('gadm_domestic.parquet', deployBaseUrl).href, duckdb.DuckDBDataProtocol.HTTP, false);
         await dbInstance.registerFileURL('country.parquet', new URL('country.parquet', deployBaseUrl).href, duckdb.DuckDBDataProtocol.HTTP, false);
         await dbInstance.registerFileURL('gadm_to_country.parquet', new URL('gadm_to_country.parquet', deployBaseUrl).href, duckdb.DuckDBDataProtocol.HTTP, false);
 
         setDb(dbInstance);
-        console.log("🟢 Engine Status: Adaptive Resolution Matrix Active");
+        console.log("🟢 Engine Status: Production Path Matrix Configured");
       } catch (error) {
         console.error("Engine Initialization Failed:", error);
       }
@@ -134,7 +131,8 @@ export default function App() {
   const layers = [
     new GeoJsonLayer({
       id: 'countries-layer',
-      data: `${import.meta.env.BASE_URL}countries.geojson`, // Dynamic path fix
+      // FIX 2: Prefix map canvas paths with BASE_URL environment variable
+      data: `${import.meta.env.BASE_URL}countries.geojson`, 
       pickable: true,
       stroked: true,
       filled: true,
@@ -151,18 +149,15 @@ export default function App() {
     
     new GeoJsonLayer({
       id: 'counties-layer',
-      data: `${import.meta.env.BASE_URL}gadm41_USA_2.json`, // Dynamic path fix
+      // FIX 3: Prefix map canvas paths with BASE_URL environment variable
+      data: `${import.meta.env.BASE_URL}gadm41_USA_2.json`, 
       pickable: true,
       stroked: true,
       filled: true,
       autoHighlight: true,
       highlightColor: [255, 255, 255, 100], 
-      
-      // --- THE ADAPTIVE VISUAL FIX ---
-      // Dynamically drop stroke thickness and opacity based on active viewState zoom
       lineWidthMinPixels: viewState.zoom > 4.5 ? 0.4 : 0.05,
       getLineColor: [255, 255, 255, viewState.zoom > 4.5 ? 35 : 6], 
-      
       getFillColor: (d) => getLogColor(domesticMap[d?.properties?.GID_2], domesticStats, thresholdMultiplier, BLUE_THEME),
       updateTriggers: { 
         getFillColor: [domesticMap, domesticStats, thresholdMultiplier],
@@ -176,7 +171,6 @@ export default function App() {
 
   return (
     <div className="relative w-screen h-screen bg-gray-900 text-white font-sans overflow-hidden">
-      {/* Updated DeckGL properties to actively listen and broadcast viewState modifications */}
       <DeckGL 
         viewState={viewState}
         onViewStateChange={e => setViewState(e.viewState)}
@@ -187,7 +181,8 @@ export default function App() {
         <Map mapStyle="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json" />
       </DeckGL>
 
-      <div className="absolute top-6 left-6 w-80 bg-gray-900/80 backdrop-blur-md p-6 rounded-2xl border border-gray-700/50 shadow-2xl pointer-events-none">
+      {/* FIX 4: Added explicit 'z-10' and pointer override classes to force the panel layout above the canvas stack */}
+      <div className="absolute top-6 left-6 w-80 bg-gray-900/80 backdrop-blur-md p-6 rounded-2xl border border-gray-700/50 shadow-2xl z-10 pointer-events-auto">
         <h1 className="text-2xl font-bold bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent mb-2">Global Connectedness</h1>
         
         <div className="bg-gray-800/80 p-4 rounded-xl border border-gray-700/50 mb-4 mt-6">
@@ -195,7 +190,7 @@ export default function App() {
           <p className="text-lg font-semibold text-white truncate">{selectedRegion}</p>
         </div>
 
-        <div className="bg-gray-800/80 p-4 rounded-xl border border-gray-700/50 pointer-events-auto transition-opacity duration-300" style={{ opacity: selectedRegion === "None" ? 0.5 : 1 }}>
+        <div className="bg-gray-800/80 p-4 rounded-xl border border-gray-700/50 transition-opacity duration-300" style={{ opacity: selectedRegion === "None" ? 0.5 : 1 }}>
           <div className="flex justify-between items-center mb-3">
             <p className="text-[10px] text-gray-400 uppercase tracking-widest font-bold">Elastic Noise Filter</p>
             <span className="text-xs text-cyan-400 font-mono font-bold">{thresholdMultiplier > 0 ? '+' : ''}{thresholdMultiplier}σ</span>
@@ -204,6 +199,7 @@ export default function App() {
         </div>
       </div>
 
+      {/* FIX 5: Added high ranking 'z-50' stacking level onto tooltip component */}
       {hoverInfo?.object?.properties && (
         <div className="absolute z-50 bg-gray-800/95 backdrop-blur-md border border-gray-600 p-3 rounded-lg shadow-2xl pointer-events-none transform -translate-x-1/2 -translate-y-[120%]" style={{ left: hoverInfo.x, top: hoverInfo.y }}>
           <p className="font-bold text-sm text-gray-100 mb-1">{hoverInfo.object.properties.NAME_2 || hoverInfo.object.properties.name || hoverInfo.object.properties.ADMIN}</p>
