@@ -1,7 +1,11 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
 
 export default defineConfig({
-  plugins: [react()],
-  base: '/social-connectedness/', // Add this line (include the trailing and leading slashes!)
+  plugins: [
+    react(),
+    tailwindcss(),
+  ],
+  base: '/social-connectedness/',
 })
