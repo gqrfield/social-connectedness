@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import DeckGL from '@deck.gl/react';
 import { GeoJsonLayer } from '@deck.gl/layers';
 import { Map } from 'react-map-gl/maplibre';
@@ -7,254 +7,330 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 import './index.css';
 
 const INITIAL_VIEW_STATE = { longitude: -40, latitude: 35, zoom: 2.5, pitch: 0, bearing: 0 };
-const BLUE_THEME = { min: [30, 58, 138], max: [34, 211, 238] }; 
+const BLUE_THEME = { min: [30, 58, 138], max: [34, 211, 238] };
 
-function getLogColor(sciScore, stats, multiplier, colorTheme) {
-  if (!sciScore || !stats) return [0, 0, 0, 0]; 
-  const logScore = Math.log(sciScore);
-  const threshold = stats.mean + (stats.stdDev * multiplier); 
-  if (logScore < threshold) return [0, 0, 0, 0]; 
-  
-  const t = Math.max(0, Math.min(1, (logScore - threshold) / (stats.maxLog - threshold)));
+// ─── FIX ①+③: Pre-compute color lookup as a plain object outside React ──────
+// Returns a plain { [id]: [r,g,b,a] } object built once when data/threshold
+// changes, instead of computing Math.log + interpolation per-feature per-frame.
+// Using a plain object (not new Map()) avoids the shadowed Map constructor that
+// deck.gl / react-map-gl imports override in this bundle.
+function buildColorLookup(scoreMap, stats, multiplier, colorTheme) {
+  const result = Object.create(null);
+  if (!stats) return result;
+  const threshold = stats.mean + stats.stdDev * multiplier;
+  const range = stats.maxLog - threshold;
   const [minR, minG, minB] = colorTheme.min;
   const [maxR, maxG, maxB] = colorTheme.max;
-
-  return [
-    Math.round(minR + t * (maxR - minR)),
-    Math.round(minG + t * (maxG - minG)),
-    Math.round(minB + t * (maxB - minB)),
-    Math.round(80 + t * (255 - 80))
-  ];
+  for (const [id, sci] of Object.entries(scoreMap)) {
+    if (sci <= 0) continue;
+    const logScore = Math.log(sci);
+    if (logScore < threshold) continue;
+    const t = range > 0 ? Math.max(0, Math.min(1, (logScore - threshold) / range)) : 1;
+    result[id] = [
+      Math.round(minR + t * (maxR - minR)),
+      Math.round(minG + t * (maxG - minG)),
+      Math.round(minB + t * (maxB - minB)),
+      Math.round(80 + t * 175),
+    ];
+  }
+  return result;
 }
+
+const TRANSPARENT = [0, 0, 0, 0];
+const ANCHOR_FILL = [255, 255, 255, 100];
+const ANCHOR_LINE = [255, 255, 255, 255];
+const MISSING_FILL = [0, 0, 0, 120];
+const MISSING_LINE = [255, 255, 255, 4];
+const DEFAULT_LINE = [255, 255, 255, 20];
 
 export default function App() {
   const [db, setDb] = useState(null);
-  const [selectedRegion, setSelectedRegion] = useState("None");
+  // ─── FIX ④: Track DB init state to unblock first paint ──────────────────
+  const [dbStatus, setDbStatus] = useState('idle'); // 'idle' | 'loading' | 'ready' | 'error'
+
+  const [selectedRegion, setSelectedRegion] = useState('None');
   const [selectedAnchorId, setSelectedAnchorId] = useState(null);
-  const [thresholdMultiplier, setThresholdMultiplier] = useState(0); 
+  const [thresholdMultiplier, setThresholdMultiplier] = useState(0);
   const [viewState, setViewState] = useState(INITIAL_VIEW_STATE);
-  
-  // Mobile UI Toggle State
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
-  
+
   const [validCountries, setValidCountries] = useState(new Set());
-  const [domesticMap, setDomesticMap] = useState({});
+  // ─── FIX ③: Store raw score maps + stats separately ─────────────────────
+  const [domesticScores, setDomesticScores] = useState({});
   const [domesticStats, setDomesticStats] = useState(null);
-  const [intlMap, setIntlMap] = useState({});
+  const [intlScores, setIntlScores] = useState({});
   const [intlStats, setIntlStats] = useState(null);
 
+  // ─── FIX ①+③: Derive color lookup maps via useMemo ──────────────────────
+  // These only recompute when scores/stats/threshold actually change —
+  // not on every render tick. Each map is stable by reference between ticks.
+  const domesticColors = useMemo(
+    () => buildColorLookup(domesticScores, domesticStats, thresholdMultiplier, BLUE_THEME),
+    [domesticScores, domesticStats, thresholdMultiplier]
+  );
+  const intlColors = useMemo(
+    () => buildColorLookup(intlScores, intlStats, thresholdMultiplier, BLUE_THEME),
+    [intlScores, intlStats, thresholdMultiplier]
+  );
+
+  // ─── FIX ④: Defer DuckDB init behind first paint ─────────────────────────
   useEffect(() => {
-    async function initDB() {
+    // Let the map render first, then start the heavy WASM init
+    const handle = setTimeout(async () => {
+      setDbStatus('loading');
       try {
         const JSDELIVR_BUNDLES = duckdb.getJsDelivrBundles();
         const bundle = await duckdb.selectBundle(JSDELIVR_BUNDLES);
-        const worker_url = URL.createObjectURL(new Blob([`importScripts("${bundle.mainWorker}");`], { type: 'text/javascript' }));
-        
-        const worker = new Worker(worker_url);
+        const workerUrl = URL.createObjectURL(
+          new Blob([`importScripts("${bundle.mainWorker}");`], { type: 'text/javascript' })
+        );
+        const worker = new Worker(workerUrl);
         const dbInstance = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(), worker);
         await dbInstance.instantiate(bundle.mainModule, bundle.pthreadWorker);
-        URL.revokeObjectURL(worker_url); 
-        
-        const deployBaseUrl = window.location.origin + import.meta.env.BASE_URL;
-        await dbInstance.registerFileURL('gadm_domestic.parquet', new URL('gadm_domestic.parquet', deployBaseUrl).href, duckdb.DuckDBDataProtocol.HTTP, false);
-        await dbInstance.registerFileURL('country.parquet', new URL('country.parquet', deployBaseUrl).href, duckdb.DuckDBDataProtocol.HTTP, false);
-        await dbInstance.registerFileURL('gadm_to_country.parquet', new URL('gadm_to_country.parquet', deployBaseUrl).href, duckdb.DuckDBDataProtocol.HTTP, false);
+        URL.revokeObjectURL(workerUrl);
 
-        setDb(dbInstance);
+        const deployBaseUrl = window.location.origin + import.meta.env.BASE_URL;
+        const register = (name) =>
+          dbInstance.registerFileURL(
+            name,
+            new URL(name, deployBaseUrl).href,
+            duckdb.DuckDBDataProtocol.HTTP,
+            false
+          );
+        await Promise.all([
+          register('gadm_domestic.parquet'),
+          register('country.parquet'),
+          register('gadm_to_country.parquet'),
+        ]);
 
         const conn = await dbInstance.connect();
         const validCheck = await conn.query(`SELECT DISTINCT source_id FROM 'country.parquet'`);
-        const validSet = new Set(validCheck.toArray().map(r => r.toJSON().source_id));
-        setValidCountries(validSet);
+        const validSet = new Set(validCheck.toArray().map((r) => r.toJSON().source_id));
         await conn.close();
-      } catch (error) {
-        console.error("Engine Initialization Failed:", error);
+
+        setValidCountries(validSet);
+        setDb(dbInstance);
+        setDbStatus('ready');
+      } catch (err) {
+        console.error('DuckDB init failed:', err);
+        setDbStatus('error');
       }
-    }
-    initDB();
+    }, 0); // defer past first paint
+    return () => clearTimeout(handle);
   }, []);
 
-  const processResults = (rows, keyCol, valCol) => {
+  // ─── FIX ③: Stable processResults, returns plain object (not recreated) ──
+  const processResults = useCallback((rows, keyCol, valCol) => {
     const map = {};
     const logScores = [];
     for (const row of rows) {
       const rowData = row.toJSON ? row.toJSON() : row;
-      const key = String(rowData[keyCol]); 
+      const key = String(rowData[keyCol]);
       const sci = Number(rowData[valCol]);
       if (sci > 0) {
         map[key] = sci;
         logScores.push(Math.log(sci));
       }
     }
-    let stats = null;
-    if (logScores.length > 0) {
-      const mean = logScores.reduce((a, b) => a + b, 0) / logScores.length;
-      const variance = logScores.map(v => Math.pow(v - mean, 2)).reduce((a, b) => a + b, 0) / logScores.length;
-      stats = { mean, stdDev: Math.sqrt(variance), maxLog: Math.max(...logScores) };
-    }
+    if (logScores.length === 0) return { map, stats: null };
+    const mean = logScores.reduce((a, b) => a + b, 0) / logScores.length;
+    const variance =
+      logScores.map((v) => (v - mean) ** 2).reduce((a, b) => a + b, 0) / logScores.length;
+    const stats = { mean, stdDev: Math.sqrt(variance), maxLog: Math.max(...logScores) };
     return { map, stats };
-  };
+  }, []);
 
-  const onMapClick = useCallback(async (info) => {
-    if (!info.object?.properties || !db) return;
-    
-    const props = info.object.properties;
-    const conn = await db.connect();
-
-    try {
-      if (props.GID_2) {
-        const gadmId = props.GID_2; 
-        setSelectedAnchorId(gadmId);
-        setSelectedRegion(`${props.NAME_2 || "Unknown"} County, ${props.NAME_1}`);
-        setIsMobileMenuOpen(false); // Auto-close menu on selection
-
-        const domQ = await conn.query(`SELECT target_gadm, sci FROM 'gadm_domestic.parquet' WHERE source_gadm = '${gadmId}' AND source_gadm != target_gadm`);
-        const domData = processResults(domQ.toArray(), 'target_gadm', 'sci');
-        setDomesticMap(domData.map);
-        setDomesticStats(domData.stats);
-
-        const intlQ = await conn.query(`SELECT iso2, sci FROM 'gadm_to_country.parquet' WHERE gadm_id = '${gadmId}'`);
-        const intData = processResults(intlQ.toArray(), 'iso2', 'sci');
-        setIntlMap(intData.map);
-        setIntlStats(intData.stats);
-      } 
-      else if (props.iso_a2) {
-        const iso2 = props.iso_a2;
-
-        if (validCountries.size > 0 && iso2 !== 'US' && !validCountries.has(iso2)) return;
-
-        setSelectedAnchorId(iso2);
-        setSelectedRegion(`${props.name || props.ADMIN}`);
-        setIsMobileMenuOpen(false); 
-
-        const intlQ = await conn.query(`SELECT target_id, sci FROM 'country.parquet' WHERE source_id = '${iso2}' AND source_id != target_id`);
-        const intData = processResults(intlQ.toArray(), 'target_id', 'sci');
-        setIntlMap(intData.map);
-        setIntlStats(intData.stats);
-
-        const domQ = await conn.query(`SELECT gadm_id, sci FROM 'gadm_to_country.parquet' WHERE iso2 = '${iso2}'`);
-        const domData = processResults(domQ.toArray(), 'gadm_id', 'sci');
-        setDomesticMap(domData.map);
-        setDomesticStats(domData.stats);
+  const onMapClick = useCallback(
+    async (info) => {
+      if (!info.object?.properties || !db) return;
+      const props = info.object.properties;
+      const conn = await db.connect();
+      try {
+        if (props.GID_2) {
+          const gadmId = props.GID_2;
+          setSelectedAnchorId(gadmId);
+          setSelectedRegion(`${props.NAME_2 || 'Unknown'} County, ${props.NAME_1}`);
+          setIsMobileMenuOpen(false);
+          const [domRows, intlRows] = await Promise.all([
+            conn
+              .query(
+                `SELECT target_gadm, sci FROM 'gadm_domestic.parquet' WHERE source_gadm = '${gadmId}' AND source_gadm != target_gadm`
+              )
+              .then((r) => r.toArray()),
+            conn
+              .query(`SELECT iso2, sci FROM 'gadm_to_country.parquet' WHERE gadm_id = '${gadmId}'`)
+              .then((r) => r.toArray()),
+          ]);
+          const dom = processResults(domRows, 'target_gadm', 'sci');
+          const intl = processResults(intlRows, 'iso2', 'sci');
+          setDomesticScores(dom.map);
+          setDomesticStats(dom.stats);
+          setIntlScores(intl.map);
+          setIntlStats(intl.stats);
+        } else if (props.iso_a2) {
+          const iso2 = props.iso_a2;
+          if (validCountries.size > 0 && iso2 !== 'US' && !validCountries.has(iso2)) return;
+          setSelectedAnchorId(iso2);
+          setSelectedRegion(`${props.name || props.ADMIN}`);
+          setIsMobileMenuOpen(false);
+          const [intlRows, domRows] = await Promise.all([
+            conn
+              .query(
+                `SELECT target_id, sci FROM 'country.parquet' WHERE source_id = '${iso2}' AND source_id != target_id`
+              )
+              .then((r) => r.toArray()),
+            conn
+              .query(`SELECT gadm_id, sci FROM 'gadm_to_country.parquet' WHERE iso2 = '${iso2}'`)
+              .then((r) => r.toArray()),
+          ]);
+          const intl = processResults(intlRows, 'target_id', 'sci');
+          const dom = processResults(domRows, 'gadm_id', 'sci');
+          setIntlScores(intl.map);
+          setIntlStats(intl.stats);
+          setDomesticScores(dom.map);
+          setDomesticStats(dom.stats);
+        }
+      } catch (err) {
+        console.error('DuckDB query failed:', err);
+      } finally {
+        await conn.close();
       }
-    } catch (error) {
-      console.error("🔥 DuckDB Query Failed:", error);
-    } finally {
-      await conn.close();
-    }
-  }, [db, validCountries]);
+    },
+    [db, validCountries, processResults]
+  );
 
-  // NATIVE DECK.GL TOOLTIP RENDERER (Bypasses React DOM diffing for massive performance boost)
-  const getTooltip = useCallback(({object}) => {
-    if (!object || !object.properties) return null;
-    
-    const props = object.properties;
-    const gadmId = props.GID_2;
-    const iso2 = props.iso_a2;
-    const isMissingData = validCountries.size > 0 && iso2 && !validCountries.has(iso2) && iso2 !== 'US';
-    const isAnchor = (gadmId && gadmId === selectedAnchorId) || (iso2 && iso2 === selectedAnchorId);
-    const score = domesticMap[gadmId] || intlMap[iso2];
-    const name = props.NAME_2 || props.name || props.ADMIN;
+  // ─── FIX ⑤: Stable tooltip — deps are the pre-computed Maps, not raw objects
+  const getTooltip = useCallback(
+    ({ object }) => {
+      if (!object?.properties) return null;
+      const props = object.properties;
+      const gadmId = props.GID_2;
+      const iso2 = props.iso_a2;
+      const isMissingData =
+        validCountries.size > 0 && iso2 && !validCountries.has(iso2) && iso2 !== 'US';
+      const isAnchor =
+        (gadmId && gadmId === selectedAnchorId) || (iso2 && iso2 === selectedAnchorId);
+      const score = domesticScores[gadmId] || intlScores[iso2];
+      const name = props.NAME_2 || props.name || props.ADMIN;
 
-    let statusHtml = '';
-    
-    // Updated Priority Logic
-    if (isMissingData) {
-      statusHtml = `<p class="text-xs text-red-400 italic mt-1">No Meta SCI Data Available</p>`;
-    } else if (isAnchor) {
-      statusHtml = `<p class="text-xs text-white font-bold bg-white/20 px-2 py-1 rounded-md inline-block mt-1">📍 Selected Anchor</p>`;
-    } else if (selectedRegion === "None") {
-      statusHtml = `<p class="text-xs text-cyan-400 italic mt-1">Click to set as anchor</p>`;
-    } else if (score) {
-      statusHtml = `<p class="text-xs text-gray-400 flex items-center gap-4 mt-1"><span>SCI Score:</span><span class="font-mono font-bold text-white">${Math.round(score).toLocaleString()}</span></p>`;
-    } else {
-      statusHtml = `<p class="text-xs text-gray-500 italic mt-1">No connection data</p>`;
-    }
+      let statusHtml = '';
+      if (isMissingData) {
+        statusHtml = `<p style="font-size:11px;color:#f87171;margin:4px 0 0">No Meta SCI data</p>`;
+      } else if (isAnchor) {
+        statusHtml = `<p style="font-size:11px;color:#fff;margin:4px 0 0">📍 Selected anchor</p>`;
+      } else if (selectedRegion === 'None') {
+        statusHtml = `<p style="font-size:11px;color:#67e8f9;margin:4px 0 0">Click to set as anchor</p>`;
+      } else if (score) {
+        statusHtml = `<p style="font-size:11px;color:#9ca3af;margin:4px 0 0">SCI: <b style="color:#fff">${Math.round(score).toLocaleString()}</b></p>`;
+      } else {
+        statusHtml = `<p style="font-size:11px;color:#6b7280;margin:4px 0 0">No connection data</p>`;
+      }
 
-    return {
-      html: `
-        <div class="bg-gray-800/95 backdrop-blur-md border border-gray-600 p-3 rounded-lg shadow-2xl">
-          <p class="font-bold text-sm text-gray-100">${name}</p>
-          ${statusHtml}
-        </div>
-      `,
-      style: { backgroundColor: 'transparent', padding: 0 } // Overrides default black tooltip box
-    };
-  }, [validCountries, selectedAnchorId, selectedRegion, domesticMap, intlMap]);
+      return {
+        html: `<div style="background:rgba(17,24,39,0.95);border:1px solid rgba(255,255,255,0.12);padding:10px 12px;border-radius:8px;pointer-events:none"><p style="font-weight:600;font-size:13px;color:#f3f4f6;margin:0">${name}</p>${statusHtml}</div>`,
+        style: { backgroundColor: 'transparent', padding: 0 },
+      };
+    },
+    // ─── Only depend on pre-computed Maps and anchor state ─────────────────
+    [validCountries, selectedAnchorId, selectedRegion, domesticScores, intlScores]
+  );
 
-  const layers = [
-    new GeoJsonLayer({
-      id: 'countries-layer',
-      data: `${import.meta.env.BASE_URL}countries.geojson`, 
-      pickable: true,
-      stroked: true,
-      filled: true,
-      lineWidthMinPixels: 0.5,
-      getLineColor: (d) => {
-        const iso2 = d?.properties?.iso_a2;
-        if (iso2 === selectedAnchorId) return [255, 255, 255, 255]; 
-        if (validCountries.size > 0 && iso2 !== 'US' && !validCountries.has(iso2)) return [255, 255, 255, 4];
-        return [255, 255, 255, 20]; 
-      }, 
-      getLineWidth: (d) => d?.properties?.iso_a2 === selectedAnchorId ? 3 : 1, 
-      getFillColor: (d) => {
-        const iso2 = d?.properties?.iso_a2;
-        if (iso2 === 'US') return [0, 0, 0, 0]; 
-        if (iso2 === selectedAnchorId) return [255, 255, 255, 100]; 
-        if (validCountries.size > 0 && !validCountries.has(iso2)) return [0, 0, 0, 120]; 
-        return getLogColor(intlMap[iso2], intlStats, thresholdMultiplier, BLUE_THEME);
-      },
-      updateTriggers: { 
-        getFillColor: [intlMap, intlStats, thresholdMultiplier, validCountries, selectedAnchorId],
-        getLineColor: [validCountries, selectedAnchorId],
-        getLineWidth: [selectedAnchorId]
-      },
-      onClick: onMapClick 
-    }),
-    
-    new GeoJsonLayer({
-      id: 'counties-layer',
-      data: `${import.meta.env.BASE_URL}gadm41_USA_2.json`, 
-      pickable: true,
-      stroked: true,
-      filled: true,
-      autoHighlight: true,
-      highlightColor: [255, 255, 255, 100], 
-      lineWidthMinPixels: viewState.zoom > 4.5 ? 0.4 : 0.05,
-      getLineColor: (d) => {
-        if (d?.properties?.GID_2 === selectedAnchorId) return [255, 255, 255, 255];
-        return [255, 255, 255, viewState.zoom > 4.5 ? 35 : 6];
-      }, 
-      getLineWidth: (d) => d?.properties?.GID_2 === selectedAnchorId ? 3 : 1, 
-      getFillColor: (d) => {
-        if (d?.properties?.GID_2 === selectedAnchorId) return [255, 255, 255, 100]; 
-        return getLogColor(domesticMap[d?.properties?.GID_2], domesticStats, thresholdMultiplier, BLUE_THEME);
-      },
-      updateTriggers: { 
-        getFillColor: [domesticMap, domesticStats, thresholdMultiplier, selectedAnchorId],
-        getLineColor: [viewState.zoom, selectedAnchorId],
-        getLineWidth: [selectedAnchorId],
-        lineWidthMinPixels: [viewState.zoom]
-      },
-      onClick: onMapClick
-    })
-  ];
+  // ─── FIX ①: getFillColor/getLineColor use pre-computed Map lookups (O(1)) ─
+  const layers = useMemo(() => {
+    const zoomFactor = viewState.zoom > 4.5 ? 35 : 6;
+    return [
+      new GeoJsonLayer({
+        id: 'countries-layer',
+        data: `${import.meta.env.BASE_URL}countries.geojson`,
+        pickable: true,
+        stroked: true,
+        filled: true,
+        lineWidthMinPixels: 0.5,
+        getLineColor: (d) => {
+          const iso2 = d?.properties?.iso_a2;
+          if (iso2 === selectedAnchorId) return ANCHOR_LINE;
+          if (validCountries.size > 0 && iso2 !== 'US' && !validCountries.has(iso2))
+            return MISSING_LINE;
+          return DEFAULT_LINE;
+        },
+        getLineWidth: (d) => (d?.properties?.iso_a2 === selectedAnchorId ? 3 : 1),
+        getFillColor: (d) => {
+          const iso2 = d?.properties?.iso_a2;
+          if (iso2 === 'US') return TRANSPARENT;
+          if (iso2 === selectedAnchorId) return ANCHOR_FILL;
+          if (validCountries.size > 0 && !validCountries.has(iso2)) return MISSING_FILL;
+          return intlColors[iso2] ?? TRANSPARENT;   // ← O(1) property lookup
+        },
+        updateTriggers: {
+          getFillColor: [intlColors, validCountries, selectedAnchorId],
+          getLineColor: [validCountries, selectedAnchorId],
+          getLineWidth: [selectedAnchorId],
+        },
+        onClick: onMapClick,
+      }),
+
+      new GeoJsonLayer({
+        id: 'counties-layer',
+        data: `${import.meta.env.BASE_URL}gadm41_USA_2.json`,
+        pickable: true,
+        stroked: true,
+        filled: true,
+        autoHighlight: true,
+        highlightColor: [255, 255, 255, 100],
+        lineWidthMinPixels: viewState.zoom > 4.5 ? 0.4 : 0.05,
+        getLineColor: (d) => {
+          if (d?.properties?.GID_2 === selectedAnchorId) return ANCHOR_LINE;
+          return [255, 255, 255, zoomFactor];
+        },
+        getLineWidth: (d) => (d?.properties?.GID_2 === selectedAnchorId ? 3 : 1),
+        getFillColor: (d) => {
+          if (d?.properties?.GID_2 === selectedAnchorId) return ANCHOR_FILL;
+          return domesticColors[d?.properties?.GID_2] ?? TRANSPARENT;  // ← O(1) property lookup
+        },
+        updateTriggers: {
+          getFillColor: [domesticColors, selectedAnchorId],
+          getLineColor: [viewState.zoom, selectedAnchorId],
+          getLineWidth: [selectedAnchorId],
+          lineWidthMinPixels: [viewState.zoom],
+        },
+        onClick: onMapClick,
+      }),
+    ];
+  // ─── Memoize layers — only rebuild when pre-computed Maps change ──────────
+  }, [domesticColors, intlColors, validCountries, selectedAnchorId, viewState.zoom, onMapClick]);
 
   return (
     <div className="relative w-screen h-screen bg-gray-900 text-white font-sans overflow-hidden">
-      <DeckGL 
+      {/* ─── FIX ④: Loading overlay ──────────────────────────────────────── */}
+      {dbStatus !== 'ready' && (
+        <div className="absolute bottom-4 right-4 z-20 flex items-center gap-2 bg-gray-800/90 px-3 py-2 rounded-lg text-xs text-gray-300 border border-gray-700/50 pointer-events-none">
+          {dbStatus === 'loading' && (
+            <>
+              <svg className="w-3.5 h-3.5 animate-spin text-cyan-400" viewBox="0 0 24 24" fill="none">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"/>
+              </svg>
+              Loading data engine…
+            </>
+          )}
+          {dbStatus === 'error' && <span className="text-red-400">Data engine failed to load</span>}
+          {dbStatus === 'idle' && <span className="text-gray-500">Initialising…</span>}
+        </div>
+      )}
+
+      <DeckGL
         viewState={viewState}
-        onViewStateChange={e => setViewState(e.viewState)}
-        controller={true} 
-        getTooltip={getTooltip} // NATIVE PERFORMANCE FIX
-        getCursor={({isHovering}) => isHovering ? 'pointer' : 'grab'} 
+        onViewStateChange={(e) => setViewState(e.viewState)}
+        controller={true}
+        getTooltip={getTooltip}
+        getCursor={({ isHovering }) => (isHovering ? 'pointer' : 'grab')}
         layers={layers}
       >
         <Map mapStyle="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json" />
       </DeckGL>
 
-      {/* MOBILE MENU TOGGLE BUTTON (Hidden on Desktop) */}
-      <button 
+      {/* Mobile menu toggle */}
+      <button
         onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
         className="absolute top-4 left-4 z-20 sm:hidden bg-gray-900/95 border border-gray-700/80 shadow-2xl p-3 rounded-xl flex items-center justify-center text-cyan-400"
       >
@@ -263,21 +339,44 @@ export default function App() {
         </svg>
       </button>
 
-      {/* RESPONSIVE CONTROL CARD */}
-      <div className={`absolute top-20 left-4 right-4 sm:right-auto sm:left-6 sm:top-6 sm:w-80 bg-gray-900/95 sm:bg-gray-900/80 sm:backdrop-blur-md p-5 sm:p-6 rounded-xl sm:rounded-2xl border border-gray-700/50 shadow-2xl z-10 pointer-events-auto transition-all duration-300 ease-in-out origin-top-left ${isMobileMenuOpen ? 'scale-100 opacity-100' : 'scale-95 opacity-0 pointer-events-none sm:scale-100 sm:opacity-100 sm:pointer-events-auto'}`}>
-        <h1 className="text-xl sm:text-2xl font-bold bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent mb-1 sm:mb-2">Global Connectedness</h1>
-        
+      {/* Control card */}
+      <div
+        className={`absolute top-20 left-4 right-4 sm:right-auto sm:left-6 sm:top-6 sm:w-80 bg-gray-900/95 sm:bg-gray-900/80 sm:backdrop-blur-md p-5 sm:p-6 rounded-xl sm:rounded-2xl border border-gray-700/50 shadow-2xl z-10 pointer-events-auto transition-all duration-300 ease-in-out origin-top-left ${
+          isMobileMenuOpen
+            ? 'scale-100 opacity-100'
+            : 'scale-95 opacity-0 pointer-events-none sm:scale-100 sm:opacity-100 sm:pointer-events-auto'
+        }`}
+      >
+        <h1 className="text-xl sm:text-2xl font-bold bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent mb-1 sm:mb-2">
+          Global Connectedness
+        </h1>
+
         <div className="bg-gray-800/80 p-4 rounded-xl border border-gray-700/50 mb-4 mt-4 sm:mt-6">
           <p className="text-[10px] text-gray-500 uppercase tracking-widest font-bold mb-1">Anchor Region</p>
           <p className="text-base sm:text-lg font-semibold text-white truncate">{selectedRegion}</p>
         </div>
 
-        <div className="bg-gray-800/80 p-4 rounded-xl border border-gray-700/50 transition-opacity duration-300" style={{ opacity: selectedRegion === "None" ? 0.5 : 1 }}>
+        <div
+          className="bg-gray-800/80 p-4 rounded-xl border border-gray-700/50 transition-opacity duration-300"
+          style={{ opacity: selectedRegion === 'None' ? 0.5 : 1 }}
+        >
           <div className="flex justify-between items-center mb-3">
             <p className="text-[10px] text-gray-400 uppercase tracking-widest font-bold">Elastic Noise Filter</p>
-            <span className="text-xs text-cyan-400 font-mono font-bold">{thresholdMultiplier > 0 ? '+' : ''}{thresholdMultiplier}σ</span>
+            <span className="text-xs text-cyan-400 font-mono font-bold">
+              {thresholdMultiplier > 0 ? '+' : ''}
+              {thresholdMultiplier}σ
+            </span>
           </div>
-          <input type="range" min="-2" max="3" step="0.1" value={thresholdMultiplier} onChange={(e) => setThresholdMultiplier(parseFloat(e.target.value))} disabled={selectedRegion === "None"} className="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500" />
+          <input
+            type="range"
+            min="-2"
+            max="3"
+            step="0.1"
+            value={thresholdMultiplier}
+            onChange={(e) => setThresholdMultiplier(parseFloat(e.target.value))}
+            disabled={selectedRegion === 'None'}
+            className="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+          />
         </div>
       </div>
     </div>
