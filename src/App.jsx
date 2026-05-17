@@ -4,6 +4,7 @@ import { GeoJsonLayer } from '@deck.gl/layers';
 import { Map } from 'react-map-gl/maplibre';
 import * as duckdb from '@duckdb/duckdb-wasm';
 import 'maplibre-gl/dist/maplibre-gl.css';
+import './index.css';
 
 const INITIAL_VIEW_STATE = { longitude: -40, latitude: 35, zoom: 2.5, pitch: 0, bearing: 0 };
 const BLUE_THEME = { min: [30, 58, 138], max: [34, 211, 238] }; 
